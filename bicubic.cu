@@ -781,7 +781,7 @@ void gaussian_blur_h_trans_cuda(
 //   Extremely fast, but one known flaw,
 //    random(0) = 0
 //   Also, it is invertable, so not cryptographic
-//   But excellent statistical properties otherwise...
+//   But excellent statistical properties!
 //-----------------
 
 __device__ uint32_t random(uint32_t h)
@@ -1061,6 +1061,67 @@ unsigned int augment_photometric_cuda(
 
 
 
+//--------------------------
+// restore_uint8_features_kernel
+//
+//   Restores the DINO features 
+//     from    uint8     frames
+//     to      float32   tensor
+//
+//   input   [N frame]   (utf8)
+//   output  [N H W C]
+//
+//   frame format:
+//     header   minvals  maxvals  payload
+//
+//   header:    H (uint32)  W (uint32)  C (uint32)
+//   minvals:   [N]  (float16)
+//   maxvals:   [N]  (float16)
+//   payload:   [H W C]  (uint8)  0 minval  255 maxval
+//--------------------------
+
+void restore_uint8_features_kernel(
+	const uint8_t* __restrict__ input_data,
+	float*         __restrict__ output_data,
+	int N, int H, int W, int C, int F)
+{
+	// Get the rank
+	int x = blockIdx.x * blockDim.x + threadIdx.x;
+	int y = blockIdx.y * blockDim.y + threadIdx.y;
+	int n = blockIdx.z;
+
+	if (x >= W || y >= H || n >= N)
+		return;
+
+	// Byte offsets in the frame
+	uint32_t b0 = 0;
+	uint32_t b1 = 12;
+	uint32_t b2 = b1 + 2*N;
+	uint32_t b3 = b2 + 2*N;
+	uint32_t b4 = b3 + H*W*C;
+	
+	// Pointer to the correct image offset
+	uint8_t* input  = input_data + n*b4;
+	float*   output = output_data + n*H*W*C;
+	
+	// Pointer to the correct frame offsets
+	__half* minvals = reinterpret_cast<__half*>(   input + b1  );
+	__half* maxvals = reinterpret_cast<__half*>(   input + b2  );
+	uint8_t* indata = input + b3;
+
+	//-----
+	// Restore the data!   (from uint8 to float32)
+	//-----
+	uint32_t idx = y*W*C + x*C;
+	for (c=0; c<C; c++) {
+		float   minval = (float)minvals[n];
+		float   maxval = (float)maxvals[n];
+		float   val    = (float)indata[idx];
+		val = minval + (maxval-minval)*(1.0/255.0)*val;
+		outdata[idx] = val;
+		idx++;
+	}
+}
 
 
 //--------------------------
@@ -1086,6 +1147,8 @@ void restore_uint8_features_cuda(
 	torch::Tensor input,
 	torch::Tensor output)
 {
+	printf("BEGIN restore_uint8_features_cuda\n");
+	
 	input_data  = input.data_ptr<float>();
 	output_data = output.data_ptr<uint8>();
 	
@@ -1114,7 +1177,25 @@ void restore_uint8_features_cuda(
 		exit(1);
 	}
 	
-	// Restore using CUDA
-	
+
+	// Run the kernel
+	dim3 threadsPerBlock(32, 32, 1); // 32x16 block in x-y plane, 4 deep in z
+	dim3 numBlocks((iW+31)/32, (iH+31)/32, iN);
+
+	restore_uint8_features_kernel<<<threadsPerBlock, numBlocks>>>(
+		input_data,
+		output_data,
+		iN, iH, iW, iC, oFrame);
+
+
+	printf("END   restore_uint8_features_cuda\n");
 }
+
+
+//--------------------------
+//  Rand-augment round
+//--------------------------
+
+//void rand_agument_cuda()
+
 
