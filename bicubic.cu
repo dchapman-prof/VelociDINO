@@ -2,6 +2,8 @@
 #include <cstdio>
 #include <torch/extension.h>
 
+#define PI_OVER_180  0.0174532925199
+
 //--------------------
 // Calculations for cubic spline interpolation
 //  y = a x^3 + b x^2 + c x + d
@@ -844,6 +846,41 @@ __device__ float random_n(uint32_t seed) {
 	return 1.41421356237 * erf_inv_david(2.0*x - 1);
 }
 
+// Pseudorandom uniform
+__device__ float random_uniform(uint32_t seed, float minval, float maxval)
+{
+	return minval + (maxval-minval)*random_f(seed);
+}
+
+// Pseudorandom log-uniform
+__device__ float random_log_uniform(uint32_t seed, float minval, float maxval)
+{
+	float log_minval = __log2f(minval);
+	float log_maxval = __log2f(maxval);
+	float log_random = random_uniform(seed, log_minval, log_maxval);
+	float random     = __exp2f(log_random);
+	return random;
+}
+
+//-----------------------
+//  Inverse Cumulative distribution function for the
+//   exponential distribution.
+//
+//  f(x) =   a e^(-ax)    (pdf)
+//  F(x) = 1 - e^(-ax)    (cdf)
+//    x  = ln(1-F) / (-a) (inv cdf)
+//-----------------------
+__device__ float inv_expo_cdf(float F, float lamda)
+{
+	return __logf(1.0001 - F) / (-lamda);
+}
+
+__device__ float random_expo(uint32_t seed, float lamda)
+{
+	float F = random_f(seed);
+	return inv_expo_cdf(F, lamda);
+}
+
 
 
 //--------------------------
@@ -1191,11 +1228,417 @@ void restore_uint8_features_cuda(
 	printf("END   restore_uint8_features_cuda\n");
 }
 
+__device__ float distance(float x1, float y1, float x2, float y2)
+{
+	return __sqrtf( (x2-x1)*(x2-x1) + (y2-y1)*(y2-y1) );
+}
+
 
 //--------------------------
-//  Rand-augment round
+//  roll_dice_kernel
+//
+//    bicubic parameters
+//  horiz_flip         Bernoulli(0.5)              Standard symmetry.
+//  area_scale	       Log-Uniform(0.08, 1.0)      Forces scale invariance across octaves.
+//  aspect_ratio       Log-Uniform(0.75, 1.3333)   Handles different sensor shapes.
+//  rotation           Normal(0, 15°)              90% of the time; helps with camera tilt.
+//  corner_jitter      Uniform(-0.08*L, 0.08*L)	   Adds non-rigid perspective robustness.
+//                       note L = sqrt(area_scale)
+//
+//    gaussian blur
+//  sigma_blur(pixels)​ HalfNormal(sig=1.0)         Most images have σ<1.0. Only rare ones are very blurry.
+//  blur_aspect        Log-Uniform(0.75,1.3333)    Ratio of σx​/σy​,"20% of the time, apply this to simulate motion blur."
+//
+//    photometric parameters
+//  h_shift (Hue)      Normal(0.0,7.0) degrees     Hue is sensitive. A little goes a long way. approx +- 7 degrees.
+//  s_factor (Sat)     LogUniform(0.7,1.4)         Multiplicative. Avoids ""gray-scale"" unless you explicitly want it."
+//  v_factor (Value)   LogUniform(0.5,1.5)         Simulates exposure/lighting. Log-uniform makes ""half-light"" as likely as ""double-light."""
+//  sol_threshold      Uniform(0.6,0.95)           Flip only the brightest pixels to create a halo
+//  sol_chance         Bernoulli(0.05)             (Solarize) Use sparingly. Only apply with a 5% probability.
+//  noise_scale        Exponential(λ=20)           Most images should have low noise; few should be very grainy.
+//
+//    shapes
+//  iH iW   oH oW   mH iW     inimage (i) outimg (o) and mask (m) dimensions
+//
+//    outputs
+//  img_corners  [N 4 2]   corner points  (float32)
+//  img_aa_ker   [N 2]     anti-alaising kernel (int32)
+//  mask_corners [N 4 2]   corner points  (float32)
+//  blur_sigmas_x  [N]     float32    blur kernel sigmas array (horizontal)
+//  blur_sigmas_y  [N]     float32    blur kernel sigmas array (vertical)
+//  h_shifts  [N]          float32    hue shift
+//  s_factors [N]          float32    saturation factor
+//  v_fators  [N]          float32    value factor
+//  sol_thresholds [N]     float32    threshold for solarization
+//  noise_scales [N]       float32    noise scales to add
+//
+//   returns updated seed
+//--------------------------
+__global__
+void roll_dice_kernel(
+	float _horiz_flip,                                // Bernoulli(0.5)              Standard symmetry.
+	float _area_scale_lo, float _area_scale_hi,       // Log-Uniform(0.08, 1.0)      Forces scale invariance across octaves.
+	float _aspect_ratio_lo, float _aspect_ratio_hi,   // Log-Uniform(0.75, 1.3333)   Handles different sensor shapes.
+	float _rotation,                                  // Normal(0, 15°)              90% of the time; helps with camera tilt.
+	float _corner_jitter,                             // Uniform(-0.08*L, 0.08*L)	   Adds non-rigid perspective robustness.
+	float _sigma_blur,                                //  (pixels)​ HalfNormal(sig=1.0)         Most images have σ<1.0. Only rare ones are very blurry.
+	float _blur_aspect_lo, float _blur_aspect_hi,     // Log-Uniform(0.75,1.3333)    Ratio of σx​/σy​,"20% of the time, apply this to simulate motion blur."
+	float _h_shift,                                   //  Normal(0,0.02)              Hue is sensitive. A little goes a long way. 0.02 is approx ±7∘.
+	float _s_factor_lo, float _s_factor_hi,           //  LogUniform(0.7,1.4)         Multiplicative. Avoids ""gray-scale"" unless you explicitly want it."
+	float _v_factor_lo, float _v_factor_hi,           //  LogUniform(0.5,1.5)         Simulates exposure/lighting. Log-uniform makes ""half-light"" as likely as ""double-light."""
+	float _sol_threshold_lo, float _sol_threshold_hi, //  Uniform(0.6,0.95)           Flip only the brightest pixels to create a halo
+	float _sol_chance,                                //  Bernoulli(0.05)             (Solarize) Use sparingly. Only apply with a 5% probability.
+	float _noise_scale,                               //  Exponential(λ=20)           Most images should have low noise; few should be very grainy.
+	int iH, int iW, int oH, int oW, int mH, int mW,   // Image, outimg, and mask dimensions
+	int N,
+	float* __restrict__ img_corners_data,
+	float* __restrict__ img_aa_ker_data,
+	float* __restrict__ mask_corners_data,
+	float* __restrict__ blur_sigmas_x_data,  // Blur kernel sigmas array [N]
+	float* __restrict__ blur_sigmas_y_data,  // Blur kernel sigmas signams array [N]
+	float* __restrict__ h_shifts_data,       // Hue shift array [N]  (-180.0 to 180.0)
+	float* __restrict__ s_factors_data,      // Saturation factor array [N]
+	float* __restrict__ v_factors_data,      // Value (Brightness) factor array [N]
+	float* __restrict__ sol_thresholds_data, // Solarization threshold array [N]
+	float* __restrict__ noise_scales_data,   // Noise scales for gaussian additive noise
+	unsigned int seed)
+{
+	// What's our rank?
+	int bid = blockIdx.x;
+	int tid = threadIdx.x;
+	int n_thread = blockDim.x;
+	int rank = bid * n_thread + tid;
+	
+	if (rank>N)   // out of bounds
+		return;
+	
+	//-----
+	// Roll the dice
+	//-----
+	unsigned int myseed = seed + rank*22;    // we need 22 seeds
+	int horiz_flip     = (random_f(myseed+0) < _horiz_flip);
+	float area_scale   = random_log_uniform(myseed+1,_area_scale_lo,_area_scale_hi);
+	float aspect_ratio = random_log_uniform(myseed+2,_aspect_ratio_lo,_aspect_ratio_hi);
+	float rotation     = random_n(myseed+3) * _rotation;
+	float L = __sqrtf(area_scale);
+	float corner_jitter_0_x = random_uniform(myseed+4,-_corner_jitter*L, _corner_jitter*L);
+	float corner_jitter_0_y = random_uniform(myseed+5,-_corner_jitter*L, _corner_jitter*L);
+	float corner_jitter_1_x = random_uniform(myseed+6,-_corner_jitter*L, _corner_jitter*L);
+	float corner_jitter_1_y = random_uniform(myseed+7,-_corner_jitter*L, _corner_jitter*L);
+	float corner_jitter_2_x = random_uniform(myseed+8,-_corner_jitter*L, _corner_jitter*L);
+	float corner_jitter_2_y = random_uniform(myseed+9,-_corner_jitter*L, _corner_jitter*L);
+	float corner_jitter_3_x = random_uniform(myseed+10,-_corner_jitter*L, _corner_jitter*L);
+	float corner_jitter_3_y = random_uniform(myseed+11,-_corner_jitter*L, _corner_jitter*L);
+	float sigma_blur   = __abs(  random_n(myseed+12)*_sigma_blur );
+	float blur_aspect  = random_log_uniform(myseed+13,_blur_aspect_lo,_blur_aspect_hi);
+	float h_shift    = random_n(myseed+14) * _h_shift;
+	float s_factor   = random_log_uniform(myseed+15,_s_factor_lo,_s_factor_hi);
+	float v_factor   = random_log_uniform(myseed+16,_v_factor_lo,_v_factor_hi);
+	float sol_threshold = random_uniform(myseed+17,_sol_thresh_lo,_sol_thresh_hi);
+	int solarize      = (random_f(myseed+18) < _sol_chance);
+	float noise_scale = random_expo(myseed+19, _noise_scale);
+	float translate_x = random_f(myseed+20);
+	float translate_y = random_f(myseed+21);
+	
+	// to solarize or not ?
+	sol_threshold = (solarize) ? sol_threshold : 9999.0;
+	
+	//-----
+	// Calculate relative width and height
+	//-----
+	float sqrt_aspect_ratio = __sqrt(aspect_ratio);
+	float width  = L * sqrt_aspect_ratio;   // relative to 1.0 source image
+	float height = L / sqrt_aspect_ratio;
+
+	float sqrt_blur_aspect = __sqrt(blur_aspect);
+	float sigma_blur_x = sigma_blur * sqrt_blur_aspect;
+	float sigma_blur_y = sigma_blur / sqrt_blur_aspect;
+
+	//-----
+	// Output Blur and Photometric parameters
+	//-----
+	blur_sigmas_x_data[rank]  = sigma_blur_x;   // Blur kernel sigmas array [N]
+	blur_sigmas_y_data[rank]  = sigma_blur_y;   // Blur kernel sigmas signams array [N]
+	h_shifts_data[rank]       = h_shift;        // Hue shift array [N]  (-180.0 to 180.0)
+	s_factors_data[rank]      = s_factor;       // Saturation factor array [N]
+	v_factors_data[rank]      = v_factor;       // Value (Brightness) factor array [N]
+	sol_thresholds_data[rank] = sol_threshold;  // Solarization threshold array [N]
+	noise_scales_data[rank]   = noise_scale;    // Noise scales for gaussian additive noise
+
+	//-----
+	// Calculate corner points
+	//-----
+	
+	// Rotation axes
+	float ux = cos(rotation * PI_OVER_180);
+	float uy = sin(rotation * PI_OVER_180);
+	float vx = -uy;
+	float vy = ux;
+	
+	// Clean corner points (pre trans/jitter/flip)
+	//   origin 0,0
+	float c0_x_raw = -0.5*width*ux - 0.5*height*vx;
+	float c0_y_raw = -0.5*width*uy - 0.5*height*vy;
+	float c1_x_raw =  0.5*width*ux - 0.5*height*vx;
+	float c1_y_raw =  0.5*width*uy - 0.5*height*vy;
+	float c2_x_raw =  0.5*width*ux + 0.5*height*vx;
+	float c2_y_raw =  0.5*width*uy + 0.5*height*vy;
+	float c3_x_raw = -0.5*width*ux + 0.5*height*vx;
+	float c3_y_raw = -0.5*width*uy + 0.5*height*vy;
+	
+	// Apply corner jitter
+	c0_x_raw += corner_jitter_0_x;
+	c0_y_raw += corner_jitter_0_y;
+	c1_x_raw += corner_jitter_1_x;
+	c1_y_raw += corner_jitter_1_y;
+	c2_x_raw += corner_jitter_2_x;
+	c2_y_raw += corner_jitter_2_y;
+	c3_x_raw += corner_jitter_3_x;
+	c3_y_raw += corner_jitter_3_y;
+	
+	// Apply horizontal flipping
+	float c0_x = (horiz_flip) ? c1_x_raw : c0_x_raw;
+	float c0_y = (horiz_flip) ? c1_y_raw : c0_y_raw;
+	float c1_x = (horiz_flip) ? c0_x_raw : c1_x_raw;
+	float c1_y = (horiz_flip) ? c0_y_raw : c1_y_raw;
+	float c2_x = (horiz_flip) ? c3_x_raw : c2_x_raw;
+	float c2_y = (horiz_flip) ? c3_y_raw : c2_y_raw;
+	float c3_x = (horiz_flip) ? c2_x_raw : c3_x_raw;
+	float c3_y = (horiz_flip) ? c2_y_raw : c3_y_raw;
+	
+	// Construct bounding box
+	float min_x = fminf(fminf(c0_x,c1_x),fminf(c2_x,c3_x));
+	float min_y = fminf(fminf(c0_y,c1_y),fminf(c2_y,c3_y));
+	float max_x = fmaxf(fmaxf(c0_x,c1_x),fmaxf(c2_x,c3_x));
+	float max_y = fmaxf(fmaxf(c0_y,c1_y),fmaxf(c2_y,c3_y));
+	
+	// How much room to translate?
+	float min_trans_x = -min_x;
+	float min_trans_y = -min_y;
+	float max_trans_x = 1.0-max_x;
+	float max_trans_y = 1.0-max_y;
+	
+	// Rescale translation amounts
+	translate_x = min_trans_x + (max_trans_x-min_trans_x)*translate_x;
+	translate_y = min_trans_y + (max_trans_y-min_trans_y)*translate_y;
+	
+	// Translate the corner points
+	c0_x += translate_x;	c0_y += translate_y;
+	c1_x += translate_x;	c1_y += translate_y;
+	c2_x += translate_x;	c2_y += translate_y;
+	c3_x += translate_x;	c3_y += translate_y;
+	
+	// Some very wierd 'corner' cases
+	c0_x = clamp(c0_x,0.0,1.0);  c0_y = clamp(c0_y,0.0,1.0);
+	c1_x = clamp(c0_x,0.0,1.0);  c1_y = clamp(c0_y,0.0,1.0);
+	c2_x = clamp(c0_x,0.0,1.0);  c2_y = clamp(c0_y,0.0,1.0);
+	c3_x = clamp(c0_x,0.0,1.0);  c3_y = clamp(c0_y,0.0,1.0);
+	
+	//-----
+	// Project corner points to image scale
+	//-----
+	
+	// Image corner points
+	float img_c0_x = c0_x * iW;
+	float img_c0_y = c0_y * iH;
+	float img_c1_x = c1_x * iW;
+	float img_c1_y = c1_y * iH;
+	float img_c2_x = c2_x * iW;
+	float img_c2_y = c2_y * iH;
+	float img_c3_x = c3_x * iW;
+	float img_c3_y = c3_y * iH;
+	
+	// Mask corner points
+	float mask_c0_x = c0_x * mW;
+	float mask_c0_y = c0_y * mH;
+	float mask_c1_x = c1_x * mW;
+	float mask_c1_y = c1_y * mH;
+	float mask_c2_x = c2_x * mW;
+	float mask_c2_y = c2_y * mH;
+	float mask_c3_x = c3_x * mW;
+	float mask_c3_y = c3_y * mH;
+
+	//-----
+	// Output corner points
+	//-----
+	
+	// Output image corners
+	img_corners_data[8*rank + 0] = img_c0_x;
+	img_corners_data[8*rank + 1] = img_c0_y;
+	img_corners_data[8*rank + 2] = img_c1_x;
+	img_corners_data[8*rank + 3] = img_c1_y;
+	img_corners_data[8*rank + 4] = img_c2_x;
+	img_corners_data[8*rank + 5] = img_c2_y;
+	img_corners_data[8*rank + 6] = img_c3_x;
+	img_corners_data[8*rank + 7] = img_c3_y;
+
+	// Output mask corners
+	mask_corners_data[8*rank + 0] = mask_c0_x;
+	mask_corners_data[8*rank + 1] = mask_c0_y;
+	mask_corners_data[8*rank + 2] = mask_c1_x;
+	mask_corners_data[8*rank + 3] = mask_c1_y;
+	mask_corners_data[8*rank + 4] = mask_c2_x;
+	mask_corners_data[8*rank + 5] = mask_c2_y;
+	mask_corners_data[8*rank + 6] = mask_c3_x;
+	mask_corners_data[8*rank + 7] = mask_c3_y;
+
+	//-----
+	// Calculate SSAA factors
+	//-----
+
+	// Image side lengths
+	float img_x_dist_0 = distance(img_c0_x,img_c0_y, img_c1_x,img_c1_y);
+	float img_x_dist_1 = distance(img_c3_x,img_c3_y, img_c2_x,img_c2_y);
+	float img_y_dist_0 = distance(img_c0_x,img_c0_y, img_c3_x,img_c31_y);
+	float img_y_dist_1 = distance(img_c1_x,img_c1_y, img_c2_x,img_c2_y);
+	float img_x_dist   = fmaxf(img_x_dist_0, img_x_dist_1);
+	float img_y_dist   = fmaxf(img_y_dist_0, img_y_dist_1);
+
+	// How many input image pixels per output pixel ?
+	float SSAA_x = img_x_dist / oW;
+	float SSAA_y = img_y_dist / oH;
+	
+	// Perform ceiling
+	int AAY = (int)(ceilf(SSAA_y));
+	int AAX = (int)(ceilf(SSAA_x));
+	
+	//-----
+	// Output SSAA kernel
+	//-----
+	img_aa_ker_data[2*rank + 0] = AAY;
+	img_aa_ker_data[2*rank + 1] = AAX;
+}
+	
+	
+
+
+
+//--------------------------
+//  roll_dice_cuda
+//
+//    bicubic parameters
+//  horiz_flip         Bernoulli(0.5)              Standard symmetry.
+//  area_scale	       Log-Uniform(0.08, 1.0)      Forces scale invariance across octaves.
+//  aspect_ratio       Log-Uniform(0.75, 1.3333)   Handles different sensor shapes.
+//  rotation           Normal(0, 15°)              90% of the time; helps with camera tilt.
+//  corner_jitter      Uniform(-0.08*L, 0.08*L)	   Adds non-rigid perspective robustness.
+//                       note L = sqrt(area_scale)
+//
+//    gaussian blur
+//  sigma_blur(pixels)​ HalfNormal(sig=1.0)         Most images have σ<1.0. Only rare ones are very blurry.
+//  blur_aspect        Log-Uniform(0.75,1.3333)    Ratio of σx​/σy​,"20% of the time, apply this to simulate motion blur."
+//
+//    photometric parameters
+//  h_shift (Hue)      Normal(0.0,7.0) degrees     Hue is sensitive. A little goes a long way. approx +- 7 degrees.
+//  s_factor (Sat)     LogUniform(0.7,1.4)         Multiplicative. Avoids ""gray-scale"" unless you explicitly want it."
+//  v_factor (Value)   LogUniform(0.5,1.5)         Simulates exposure/lighting. Log-uniform makes ""half-light"" as likely as ""double-light."""
+//  sol_threshold      Uniform(0.6,0.95)           Flip only the brightest pixels to create a halo
+//  sol_chance         Bernoulli(0.05)             (Solarize) Use sparingly. Only apply with a 5% probability.
+//  noise_scale        Exponential(λ=20)           Most images should have low noise; few should be very grainy.
+//
+//    shapes
+//  iH iW   oH oW   mH iW     inimage (i) outimg (o) and mask (m) dimensions
+//
+//    outputs
+//  img_corners  [N 4 2]   corner points  (float32)
+//  img_aa_ker   [N 2]     anti-alaising kernel (int32)
+//  mask_corners [N 4 2]   corner points  (float32)
+//  blur_sigmas_x  [N]     float32    blur kernel sigmas array (horizontal)
+//  blur_sigmas_y  [N]     float32    blur kernel sigmas array (vertical)
+//  h_shifts  [N]          float32    hue shift
+//  s_factors [N]          float32    saturation factor
+//  v_fators  [N]          float32    value factor
+//  sol_thresholds [N]     float32    threshold for solarization
+//  noise_scales [N]       float32    noise scales to add
+//
+//   returns updated seed
 //--------------------------
 
-//void rand_agument_cuda()
+unsigned int roll_dice_cuda(
+	float horiz_flip,                               // Bernoulli(0.5)              Standard symmetry.
+	float area_scale_lo, float area_scale_hi,       // Log-Uniform(0.08, 1.0)      Forces scale invariance across octaves.
+	float aspect_ratio_lo, float aspect_ratio_hi,   // Log-Uniform(0.75, 1.3333)   Handles different sensor shapes.
+	float rotation,                                 // Normal(0, 15°)              90% of the time; helps with camera tilt.
+	float corner_jitter,                            // Uniform(-0.08*L, 0.08*L)	   Adds non-rigid perspective robustness.
+	float sigma_blur,                               //  (pixels)​ HalfNormal(sig=1.0)         Most images have σ<1.0. Only rare ones are very blurry.
+	float blur_aspect_lo, float blur_aspect_hi,     // Log-Uniform(0.75,1.3333)    Ratio of σx​/σy​,"20% of the time, apply this to simulate motion blur."
+	float h_shift,                                  //  Normal(0,0.02)              Hue is sensitive. A little goes a long way. 0.02 is approx ±7∘.
+	float s_factor_lo, float s_factor_hi,           //  LogUniform(0.7,1.4)         Multiplicative. Avoids ""gray-scale"" unless you explicitly want it."
+	float v_factor_lo, float v_factor_hi,           //  LogUniform(0.5,1.5)         Simulates exposure/lighting. Log-uniform makes ""half-light"" as likely as ""double-light."""
+	float sol_threshold_lo, float sol_threshold_hi, //  Uniform(0.6,0.95)           Flip only the brightest pixels to create a halo
+	float sol_chance,                               //  Bernoulli(0.05)             (Solarize) Use sparingly. Only apply with a 5% probability.
+	float noise_scale,                              //  Exponential(λ=20)           Most images should have low noise; few should be very grainy.
+	int iH, int iW, int oH, int oW, int mH, int mW, // Image, outimg, and mask dimensions
+	torch::Tensor img_corners,
+	torch::Tensor img_aa_ker,
+	torch::Tensor mask_corners,
+	torch::Tensor blur_sigmas_x,  // Blur kernel sigmas array [N]
+	torch::Tensor blur_sigmas_y,  // Blur kernel sigmas signams array [N]
+	torch::Tensor h_shifts,       // Hue shift array [N]  (-180.0 to 180.0)
+	torch::Tensor s_factors,      // Saturation factor array [N]
+	torch::Tensor v_factors,      // Value (Brightness) factor array [N]
+	torch::Tensor sol_thresholds, // Solarization threshold array [N]
+	torch::Tensor noise_scales,   // Noise scales for gaussian additive noise
+	unsigned int seed)
+{
+	printf("BEGIN roll_dice_cuda\n");
+	
+	// Pointer into the data arrays
+	float* img_corners_data    = img_corners.data_ptr<float>();
+	float* img_aa_ker_data     = img_aa_ker.data_ptr<float>();
+	float* mask_corners_data   = mask_corners.data_ptr<float>();
+	float* blur_sigmas_x_data  = blur_sigmas_x.data_ptr<float>();
+	float* blur_sigmas_y_data  = blur_sigmas_y.data_ptr<float>();
+	float* h_shifts_data       = h_shifts.data_ptr<float>();
+	float* s_factors_data      = s_factors.data_ptr<float>();
+	float* v_factors_data      = v_factors.data_ptr<float>();
+	float* sol_thresholds_data = sol_thresholds.data_ptr<float>();
+	float* noise_scales_data   = noise_scales.data_ptr<float>();
+	
+	// Check sizes
+	int N = img_corners.sizes()[0];
+	if (N!=img_aa_ker.sizes()[0] || N!=mask_corners.sizes()[0] || 
+		N!=blur_sigmas_x.sizes()[0] || N!=blur_sigmas_y.sizes()[0] || 
+		N!=h_shifts.sizes()[0] || N!=s_factors.sizes()[0] || 
+		N!=v_factors.sizes()[0] || N!=sol_thresholds.sizes()[0] || 
+		N!=noise_scales.sizes()[0])
+	{
+		printf("ERROR: roll_dice_cuda  batch size mismatch\n");
+		exit(1);
+	}
 
+	// Run the kernel
+	roll_dice_kernel<<<(N+255)/256, 256>>>(
+		horiz_flip,                               // Bernoulli(0.5)              Standard symmetry.
+		area_scale_lo, area_scale_hi,       // Log-Uniform(0.08, 1.0)      Forces scale invariance across octaves.
+		aspect_ratio_lo, aspect_ratio_hi,   // Log-Uniform(0.75, 1.3333)   Handles different sensor shapes.
+		rotation,                                 // Normal(0, 15°)              90% of the time; helps with camera tilt.
+		corner_jitter,                            // Uniform(-0.08*L, 0.08*L)	   Adds non-rigid perspective robustness.
+		sigma_blur,                               //  (pixels)​ HalfNormal(sig=1.0)         Most images have σ<1.0. Only rare ones are very blurry.
+		blur_aspect_lo, blur_aspect_hi,     // Log-Uniform(0.75,1.3333)    Ratio of σx​/σy​,"20% of the time, apply this to simulate motion blur."
+		h_shift,                                  //  Normal(0,0.02)              Hue is sensitive. A little goes a long way. 0.02 is approx ±7∘.
+		s_factor_lo, s_factor_hi,           //  LogUniform(0.7,1.4)         Multiplicative. Avoids ""gray-scale"" unless you explicitly want it."
+		v_factor_lo, v_factor_hi,           //  LogUniform(0.5,1.5)         Simulates exposure/lighting. Log-uniform makes ""half-light"" as likely as ""double-light."""
+		sol_threshold_lo, sol_threshold_hi, //  Uniform(0.6,0.95)           Flip only the brightest pixels to create a halo
+		sol_chance,                               //  Bernoulli(0.05)             (Solarize) Use sparingly. Only apply with a 5% probability.
+		noise_scale,                              //  Exponential(λ=20)           Most images should have low noise; few should be very grainy.
+		iH, iW, oH, oW, mH, mW,             // Image and mask dimensions
+		N,
+		img_corners_data,
+		img_aa_ker_data,
+		mask_corners_data,
+		blur_sigmas_x_data,  // Blur kernel sigmas array [N]
+		blur_sigmas_y_data,  // Blur kernel sigmas signams array [N]
+		h_shifts_data,       // Hue shift array [N]  (-180.0 to 180.0)
+		s_factors_data,      // Saturation factor array [N]
+		v_factors_data,      // Value (Brightness) factor array [N]
+		sol_thresholds_data, // Solarization threshold array [N]
+		noise_scales_data,   // Noise scales for gaussian additive noise
+		seed);
+
+
+	printf("END   roll_dice_cuda\n");
+	
+	return seed + 22*N;    // 20 seeds per image consumed
+}
 
