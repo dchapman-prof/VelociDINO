@@ -30,6 +30,15 @@ def Compile():
 		void bicubic_aa_uint8_cuda(torch::Tensor out, torch::Tensor in, torch::Tensor corners, torch::Tensor aa_ker);
 		void gaussian_blur_h_trans_cuda(torch::Tensor input,torch::Tensor output,torch::Tensor sigmas);
 		unsigned int augment_photometric_cuda(torch::Tensor input, torch::Tensor output, torch::Tensor h_shifts, torch::Tensor s_factors, torch::Tensor v_factors, torch::Tensor sol_thresholds, torch::Tensor noise_scales, torch::Tensor mean, torch::Tensor std, unsigned int seed);
+		void restore_uint8_features_cuda(torch::Tensor input,torch::Tensor output);
+		unsigned int roll_dice_cuda(float horiz_flip, float area_scale_lo, float area_scale_hi,
+			float aspect_ratio_lo, float aspect_ratio_hi, float rotation, float corner_jitter,
+			float sigma_blur, float blur_aspect_lo, float blur_aspect_hi, float h_shift,
+			float s_factor_lo, float s_factor_hi, float v_factor_lo, float v_factor_hi, float sol_threshold_lo, float sol_threshold_hi, float sol_chance, float noise_scale,
+			int iH, int iW, int oH, int oW, int mH, int mW,
+			torch::Tensor img_corners, torch::Tensor img_aa_ker, torch::Tensor mask_corners, 
+			torch::Tensor blur_sigmas_x, torch::Tensor blur_sigmas_y, torch::Tensor h_shifts, torch::Tensor s_factors,
+			torch::Tensor v_factors, torch::Tensor sol_thresholds, torch::Tensor noise_scales, unsigned int seed);
 	'''
 
 	def get_cuda_arch_flags():
@@ -60,7 +69,9 @@ def Compile():
 			'bicubic_float_cuda', 
 			'bicubic_aa_uint8_cuda',
 			'gaussian_blur_h_trans_cuda',
-			'augment_photometric_cuda'],
+			'augment_photometric_cuda',
+			'restore_uint8_features_cuda',
+			'roll_dice_cuda'],
 		with_cuda=True,
 		extra_cuda_cflags=bcb__cuda_flags
 	)
