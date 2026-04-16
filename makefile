@@ -1,5 +1,4 @@
 all:
-all:
 	nvcc \
 	-O3 -c -o bicubic.o --resource-usage \
 	`python3-config --includes` \
