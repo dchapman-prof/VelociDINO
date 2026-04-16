@@ -1,11 +1,13 @@
 all:
+all:
 	nvcc \
-	-O3 --resource-usage \
-	-I/usr/include/python3.12 -I/usr/include/python3.12 \
-	-I/home/dchap/jaxenv/lib/python3.12/site-packages/torch/include \
-	-I/home/dchap/jaxenv/lib/python3.12/site-packages/torch/include/torch/csrc/api/include \
-	-L/home/dchap/jaxenv/lib/python3.12/site-packages/torch/lib \
-	-L/usr/lib/python3.12/config-3.12-x86_64-linux-gnu -L/usr/lib/x86_64-linux-gnu -lpython3.12 -ldl  -lm \
+	-O3 -c -o bicubic.o --resource-usage \
+	`python3-config --includes` \
+	`python3-config --ldflags --embed` \
+	`python3 -c "from torch.utils.cpp_extension import include_paths;_=[print('-I'+x,end=' ') for x in include_paths('cuda')]"` \
+	`python3 -c "from torch.utils.cpp_extension import library_paths;_=[print('-L'+x,end=' ') for x in library_paths('cuda')]"` \
 	-ltorch -ltorch_cpu -ltorch_cuda -lc10 -lcuda \
 	-D_GLIBCXX_USE_CXX11_ABI=0 \
 	bicubic.cu 
+
+

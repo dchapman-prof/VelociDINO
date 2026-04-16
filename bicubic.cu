@@ -1,6 +1,8 @@
 #include <iostream>
 #include <cstdio>
+#include <cmath>
 #include <torch/extension.h>
+#include <cuda_runtime.h>
 
 #define PI_OVER_180  0.0174532925199
 
@@ -150,9 +152,13 @@ void bicubic_float_kernel(
 	float c_x  = c_x0  + delta_y *  (c_x1-c_x0);
 	float c_y  = c_y0  + delta_y *  (c_y1-c_y0);
 	
+	// Correction for output center points
+	c_x -= 0.5;
+	c_y -= 0.5;
+	
 	// Out of bounds
-	c_x = clamp(c_x, 0.00001, iW-0.00001);
-	c_y = clamp(c_y, 0.00001, iH-0.00001);
+	c_x = clamp(c_x, 0.00001, iW-1.00001);
+	c_y = clamp(c_y, 0.00001, iH-1.00001);
 		
 	//------
 	// Solve the 'bicubic' interpolation coefficients
@@ -411,10 +417,14 @@ void bicubic_aa_uint8_kernel(
 			float c_y1 = c_y10 + delta_x * (c_y11-c_y10);
 			float c_x  = c_x0  + delta_y *  (c_x1-c_x0);
 			float c_y  = c_y0  + delta_y *  (c_y1-c_y0);
-			
+				
+			// Correction for output center points
+			c_x -= 0.5;
+			c_y -= 0.5;
+		
 			// Out of bounds
-			c_x = clamp(c_x, 0.00001, iW-0.00001);
-			c_y = clamp(c_y, 0.00001, iH-0.00001);
+			c_x = clamp(c_x, 0.00001, iW-1.00001);
+			c_y = clamp(c_y, 0.00001, iH-1.00001);
 				
 			//------
 			// Solve the 'bicubic' interpolation coefficients
@@ -730,8 +740,8 @@ void gaussian_blur_h_trans_cuda(
 	printf("BEGIN: gaussian_blur_h_trans_cuda\n");
 
 	// Obtain data pointers
-	float4* input_data  = input.data_ptr<float4>();
-	float4* output_data = output.data_ptr<float4>();
+	float4* input_data  = reinterpret_cast<float4*>(  input.data_ptr<float>()  );
+	float4* output_data = reinterpret_cast<float4*>(  output.data_ptr<float>() );
 	float * sigmas_data = sigmas.data_ptr<float>();
 	
 	// Obtain the dimensions
@@ -855,10 +865,10 @@ __device__ float random_uniform(uint32_t seed, float minval, float maxval)
 // Pseudorandom log-uniform
 __device__ float random_log_uniform(uint32_t seed, float minval, float maxval)
 {
-	float log_minval = __log2f(minval);
-	float log_maxval = __log2f(maxval);
+	float log_minval = log2f(minval);
+	float log_maxval = log2f(maxval);
 	float log_random = random_uniform(seed, log_minval, log_maxval);
-	float random     = __exp2f(log_random);
+	float random     = exp2f(log_random);
 	return random;
 }
 
@@ -872,7 +882,7 @@ __device__ float random_log_uniform(uint32_t seed, float minval, float maxval)
 //-----------------------
 __device__ float inv_expo_cdf(float F, float lamda)
 {
-	return __logf(1.0001 - F) / (-lamda);
+	return logf(1.0001 - F) / (-lamda);
 }
 
 __device__ float random_expo(uint32_t seed, float lamda)
@@ -1030,8 +1040,8 @@ unsigned int augment_photometric_cuda(
 	printf("BEGIN augment_photometric_cuda\n");
 	
 	// Pointer into the data
-	float4 *input_data          = input.data_ptr<float4>();
-	float4 *output_data         = output.data_ptr<float4>();
+	float4 *input_data          = reinterpret_cast<float4*>(  input.data_ptr<float>()  );
+	float4 *output_data         = reinterpret_cast<float4*>(  output.data_ptr<float>()  );
 	float  *h_shifts_data       = h_shifts.data_ptr<float>();
 	float  *s_factors_data      = s_factors.data_ptr<float>();
 	float  *v_factors_data      = v_factors.data_ptr<float>();
@@ -1112,11 +1122,11 @@ unsigned int augment_photometric_cuda(
 //     header   minvals  maxvals  payload
 //
 //   header:    H (uint32)  W (uint32)  C (uint32)
-//   minvals:   [N]  (float16)
-//   maxvals:   [N]  (float16)
+//   minvals:   [C]  (float16)
+//   maxvals:   [C]  (float16)
 //   payload:   [H W C]  (uint8)  0 minval  255 maxval
 //--------------------------
-
+__global__
 void restore_uint8_features_kernel(
 	const uint8_t* __restrict__ input_data,
 	float*         __restrict__ output_data,
@@ -1133,29 +1143,29 @@ void restore_uint8_features_kernel(
 	// Byte offsets in the frame
 	uint32_t b0 = 0;
 	uint32_t b1 = 12;
-	uint32_t b2 = b1 + 2*N;
-	uint32_t b3 = b2 + 2*N;
+	uint32_t b2 = b1 + 2*C;
+	uint32_t b3 = b2 + 2*C;
 	uint32_t b4 = b3 + H*W*C;
 	
 	// Pointer to the correct image offset
-	uint8_t* input  = input_data + n*b4;
-	float*   output = output_data + n*H*W*C;
+	const uint8_t* input  = input_data + n*b4;
+	float*         output = output_data + n*H*W*C;
 	
 	// Pointer to the correct frame offsets
-	__half* minvals = reinterpret_cast<__half*>(   input + b1  );
-	__half* maxvals = reinterpret_cast<__half*>(   input + b2  );
-	uint8_t* indata = input + b3;
+	const __half* minvals = reinterpret_cast<const __half*>(   input + b1  );
+	const __half* maxvals = reinterpret_cast<const __half*>(   input + b2  );
+	const uint8_t* indata = input + b3;
 
 	//-----
 	// Restore the data!   (from uint8 to float32)
 	//-----
 	uint32_t idx = y*W*C + x*C;
-	for (c=0; c<C; c++) {
-		float   minval = (float)minvals[n];
-		float   maxval = (float)maxvals[n];
+	for (int c=0; c<C; c++) {
+		float   minval = (float)minvals[c];
+		float   maxval = (float)maxvals[c];
 		float   val    = (float)indata[idx];
 		val = minval + (maxval-minval)*(1.0/255.0)*val;
-		outdata[idx] = val;
+		output[idx] = val;
 		idx++;
 	}
 }
@@ -1175,8 +1185,8 @@ void restore_uint8_features_kernel(
 //     header   minvals  maxvals  payload
 //
 //   header:    H (uint32)  W (uint32)  C (uint32)
-//   minvals:   [N]  (float16)
-//   maxvals:   [N]  (float16)
+//   minvals:   [C]  (float16)
+//   maxvals:   [C]  (float16)
 //   payload:   [H W C]  (uint8)  0 minval  255 maxval
 //--------------------------
 
@@ -1186,21 +1196,21 @@ void restore_uint8_features_cuda(
 {
 	printf("BEGIN restore_uint8_features_cuda\n");
 	
-	input_data  = input.data_ptr<float>();
-	output_data = output.data_ptr<uint8>();
+	uint8_t* input_data = input.data_ptr<uint8_t>();
+	float*  output_data = output.data_ptr<float>();
 	
 	// Read lengths
-	iN = input.sizes()[0];
-	iH = input.sizes()[1];
-	iW = input.sizes()[2];
-	iC = input.sizes()[3];
-	oN = output.sizes()[0];
-	oFrame = output.sizes()[1];
+	int iN = input.sizes()[0];
+	int iH = input.sizes()[1];
+	int iW = input.sizes()[2];
+	int iC = input.sizes()[3];
+	int oN = output.sizes()[0];
+	int oFrame = output.sizes()[1];
 	
 	// Calculate frame size
 	uint32_t len_header = 12;
-	uint32_t len_minvals = 2*iN;
-	uint32_t len_maxvals = 2*iN;
+	uint32_t len_minvals = 2*iC;
+	uint32_t len_maxvals = 2*iC;
 	uint32_t len_payload = iH*iW*iC;
 	uint32_t len_frame = len_header + len_minvals + len_maxvals + len_payload;
 	
@@ -1230,7 +1240,7 @@ void restore_uint8_features_cuda(
 
 __device__ float distance(float x1, float y1, float x2, float y2)
 {
-	return __sqrtf( (x2-x1)*(x2-x1) + (y2-y1)*(y2-y1) );
+	return sqrtf( (x2-x1)*(x2-x1) + (y2-y1)*(y2-y1) );
 }
 
 
@@ -1320,7 +1330,7 @@ void roll_dice_kernel(
 	float area_scale   = random_log_uniform(myseed+1,_area_scale_lo,_area_scale_hi);
 	float aspect_ratio = random_log_uniform(myseed+2,_aspect_ratio_lo,_aspect_ratio_hi);
 	float rotation     = random_n(myseed+3) * _rotation;
-	float L = __sqrtf(area_scale);
+	float L = sqrtf(area_scale);
 	float corner_jitter_0_x = random_uniform(myseed+4,-_corner_jitter*L, _corner_jitter*L);
 	float corner_jitter_0_y = random_uniform(myseed+5,-_corner_jitter*L, _corner_jitter*L);
 	float corner_jitter_1_x = random_uniform(myseed+6,-_corner_jitter*L, _corner_jitter*L);
@@ -1329,12 +1339,12 @@ void roll_dice_kernel(
 	float corner_jitter_2_y = random_uniform(myseed+9,-_corner_jitter*L, _corner_jitter*L);
 	float corner_jitter_3_x = random_uniform(myseed+10,-_corner_jitter*L, _corner_jitter*L);
 	float corner_jitter_3_y = random_uniform(myseed+11,-_corner_jitter*L, _corner_jitter*L);
-	float sigma_blur   = __abs(  random_n(myseed+12)*_sigma_blur );
+	float sigma_blur   = fabsf(  random_n(myseed+12)*_sigma_blur );
 	float blur_aspect  = random_log_uniform(myseed+13,_blur_aspect_lo,_blur_aspect_hi);
 	float h_shift    = random_n(myseed+14) * _h_shift;
 	float s_factor   = random_log_uniform(myseed+15,_s_factor_lo,_s_factor_hi);
 	float v_factor   = random_log_uniform(myseed+16,_v_factor_lo,_v_factor_hi);
-	float sol_threshold = random_uniform(myseed+17,_sol_thresh_lo,_sol_thresh_hi);
+	float sol_threshold = random_uniform(myseed+17,_sol_threshold_lo,_sol_threshold_hi);
 	int solarize      = (random_f(myseed+18) < _sol_chance);
 	float noise_scale = random_expo(myseed+19, _noise_scale);
 	float translate_x = random_f(myseed+20);
@@ -1346,11 +1356,11 @@ void roll_dice_kernel(
 	//-----
 	// Calculate relative width and height
 	//-----
-	float sqrt_aspect_ratio = __sqrt(aspect_ratio);
+	float sqrt_aspect_ratio = sqrtf(aspect_ratio);
 	float width  = L * sqrt_aspect_ratio;   // relative to 1.0 source image
 	float height = L / sqrt_aspect_ratio;
 
-	float sqrt_blur_aspect = __sqrt(blur_aspect);
+	float sqrt_blur_aspect = sqrtf(blur_aspect);
 	float sigma_blur_x = sigma_blur * sqrt_blur_aspect;
 	float sigma_blur_y = sigma_blur / sqrt_blur_aspect;
 
@@ -1489,7 +1499,7 @@ void roll_dice_kernel(
 	// Image side lengths
 	float img_x_dist_0 = distance(img_c0_x,img_c0_y, img_c1_x,img_c1_y);
 	float img_x_dist_1 = distance(img_c3_x,img_c3_y, img_c2_x,img_c2_y);
-	float img_y_dist_0 = distance(img_c0_x,img_c0_y, img_c3_x,img_c31_y);
+	float img_y_dist_0 = distance(img_c0_x,img_c0_y, img_c3_x,img_c3_y);
 	float img_y_dist_1 = distance(img_c1_x,img_c1_y, img_c2_x,img_c2_y);
 	float img_x_dist   = fmaxf(img_x_dist_0, img_x_dist_1);
 	float img_y_dist   = fmaxf(img_y_dist_0, img_y_dist_1);
