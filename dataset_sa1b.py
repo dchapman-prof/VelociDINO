@@ -108,7 +108,7 @@ if __name__ == "__main__":
 	
 	test_data_pipeline(
 		dataset_folder=FOLDER_PATH,
-		batch_size=8,	  # Start small to monitor memory
+		batch_size=8,	 # Start small to monitor memory
 		num_workers=4,	 # Adjust based on your CPU cores
 		num_batches=10	 # Just a quick smoke test
 	)
