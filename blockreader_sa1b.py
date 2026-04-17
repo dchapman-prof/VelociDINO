@@ -22,7 +22,7 @@ import numpy as np
 # (This is true for the standard SA-1B release, which has a 1500px short side).
 #-------------------------------
 
-class SA1B_DINO(Dataset):
+class SA1B_DINO_blockreader:
 
 	#--------------------
 	#	__init__:
@@ -31,12 +31,13 @@ class SA1B_DINO(Dataset):
 	#		transform (callable, optional): Additional torchvision transforms to apply after cropping
 	#										(e.g., transforms.ToTensor()).
 	#--------------------
-	def __init__(self, folder_path):
+	def __init__(self, folder_path, batch_size):
 		self.folder_path = folder_path
 		self.crop_size = (1500, 1500)
 		self.images_lmdb_path = os.path.join(folder_path, 'images.lmdb')
 		self.feat_lmdb_path   = os.path.join(folder_path, 'dino.lmdb')
 		self.keys_txt_path  = os.path.join(folder_path,   'images.txt')
+		self.batch_size = batch_size
 
 		# 1. Read the keys from the text file (fast)
 		if not os.path.exists(self.keys_txt_path):
@@ -44,7 +45,7 @@ class SA1B_DINO(Dataset):
 
 		with open(self.keys_txt_path, 'r') as f:
 			# Strip whitespace and ignore empty lines
-			self.keys = [line.strip() for line in f if line.strip()]
+			self.keys = [line.strip().encode('ascii') for line in f if line.strip()]
 
 		# 2. LMDB Setup (environment initialized later, lazily, for better multiprocessing support)
 		self.images_env = None
@@ -55,12 +56,12 @@ class SA1B_DINO(Dataset):
 		# Define the center crop transform
 		self.center_crop = transforms.CenterCrop(self.crop_size)
 
-	#-----------------
-	#	Initializes the LMDB environment lazily.
-	#	This is crucial when using multiple worker processes in a DataLoader
-	#	to avoid file descriptor issues.
-	#-----------------
-	def _init_lmdb(self):
+		#-----------------
+		#	Initializes the LMDB environment lazily.
+		#	This is crucial when using multiple worker processes in a DataLoader
+		#	to avoid file descriptor issues.
+		#-----------------
+
 		# Open the environment in read-only mode, with no write locks for performance
 		# (unless user specifically requested locks)
 		self.images_env = lmdb.open(self.images_lmdb_path, readonly=True, lock=False, readahead=False, meminit=False)
@@ -68,41 +69,73 @@ class SA1B_DINO(Dataset):
 		self.feat_env = lmdb.open(self.feat_lmdb_path, readonly=True, lock=False, readahead=False, meminit=False)
 		self.feat_txn = self.feat_env.begin(write=False)
 
-	def __len__(self):
+		#-------
+		# Allocate the feature buffers
+		#-------
+		self.len_frame = 1574412   # length of a DINO frame, ToDo make adaptive
+		self.images_np   = np.zeros((batch_size, 1500, 1500, 3), dtype=np.uint8)
+		self.features_np = np.zeros((batch_size, self.len_frame), dtype=np.uint8)
+
+		#-------
+		# Set the start and end indices
+		#-------
+		self.sidx = 0
+		self.eidx = 0
+
+	def len(self):
 		return len(self.keys)
 
-	def __getitem__(self, index):
-		# 0. Lazy initialization of LMDB env on the first access (important for workers)
-		if self.images_env is None or self.feat_env is None:
-			self._init_lmdb()
+	def read_batch(self):
+
+		# Obtain the list of keys
+		n_keys = len(self.keys)
+		self.sidx = self.eidx % n_keys
+		self.eidx = min(self.sidx+self.batch_size, n_keys)
+		B = self.eidx - self.sidx
 
 		# 1. Get the key (filename)
-		key_str = self.keys[index]
-		key_bytes = key_str.encode('ascii') # Convert string key to bytes for LMDB fetch
+		keys = self.keys[self.sidx:self.eidx]
 
-		# 2. Fetch binary JPEG data from LMDB
-		# Use the transaction (txn) to fetch
-		jpeg_bin = self.images_txn.get(key_bytes)
-		feat_bin = self.feat_txn.get(key_bytes)
+		#-----------
+		# Read the images
+		#-----------
+		for b in range(B):
 
-		# Handle potential missing keys gracefully or raise an error
-		# For now, raise an error as the keys file should match the database content.
-		if jpeg_bin is None:
-			raise KeyError('Key ' + key_str + 'not found in LMDB' + self.images_lmdb_path)
-		if feat_bin is None:
-			raise KeyError('Key ' + key_str + 'not found in LMDB' + self.feat_lmdb_path)
+			# Read the JPEG bytes
+			jpeg_bin = self.images_txn.get(keys[b])
+			if jpeg_bin is None:
+				raise KeyError('Key ' + keys[b] + 'not found in LMDB' + self.images_lmdb_path)
 
-		# 3. Decompress the JPEG using PIL from memory
-		image = Image.open(io.BytesIO(jpeg_bin)).convert('RGB')
+			# Convert and crop the image
+			image = Image.open(io.BytesIO(jpeg_bin)).convert('RGB')
+			image_cropped = self.center_crop(image)
+			image_np = np.array(image_cropped, dtype=np.uint8)
 
-		# 4. Apply Center Crop
-		image_cropped = self.center_crop(image)
+			# Copy to numpy array
+			self.images_np[b,:,:,:] = image_np
 
-		# Convert image_out and features to a numpy byte arrays
-		image_np = np.array(image_cropped, dtype=np.uint8)
-		feat_np  = np.frombuffer(feat_bin, dtype=np.uint8)
+		#-----------
+		# Read the features
+		#-----------
+		for b in range(B):
 
-		return image_np, feat_np
+			# Read the features
+			feat_bin = self.feat_txn.get(keys[b])
+			if feat_bin is None:
+				raise KeyError('Key ' + keys[b] + 'not found in LMDB' + self.feat_lmdb_path)
+			feat_np  = np.frombuffer(feat_bin, dtype=np.uint8)
+
+			# Copy to numpy array
+			self.features_np[b,:] = feat_np
+
+		#-----------
+		# Return the batches
+		#-----------
+		if B==self.batch_size:
+			return self.images_np, self.features_np
+		else:
+			return self.images_np[0:B], self.features_np[0:B]
+
 
 
 #---------------------------------------
@@ -112,12 +145,10 @@ class SA1B_DINO(Dataset):
 #---------------------------------------
 if __name__ == "__main__":
 
-
 	#---------------
 	# Tests the SA-1B LMDB pipeline with shuffling and timing.
 	#---------------
 	batch_size = 128
-	num_workers = 1
 	num_batches = 1000
 	dataset_folder = "/data/developers/sa1b"
 
@@ -126,31 +157,22 @@ if __name__ == "__main__":
 
 	# Initialize the dataset
 	# Note: Using your folder-based __init__ requirement
-	dataset = SA1B_DINO(dataset_folder)
+	reader = SA1B_DINO_blockreader(dataset_folder, batch_size)
+	n_img   = reader.len()
+	n_batch = (n_img+batch_size-1) // batch_size
 
-	# 2. Setup DataLoader
-	# pin_memory=True is recommended when sending data to GPU later,
-	# though with uint8 it has less impact than with float32.
-	dataloader = DataLoader(
-		dataset,
-		batch_size=batch_size,
-		shuffle=False,		  # Essential for training
-		num_workers=num_workers,
-		drop_last=True		 # Ensures all batches are exactly the same size
-	)
-
-	print(f"Dataset size: {len(dataset)}")
+	print(f"N images: {n_img}")
+	print(f"N batches: {n_batch}")
 	print(f"Batch size: {batch_size}")
-	print(f"Workers: {num_workers}")
 	print("-" * 50)
 
 	start_time = time.time()
 	last_batch_time = start_time
 
 	# Iterate through the dataloader
-	for i, (images, features) in enumerate(dataloader):
-		if i >= num_batches:
-			break
+	for i in range(n_batch):
+
+		images, features = reader.read_batch()
 
 		current_time = time.time()
 		batch_duration = current_time - last_batch_time
