@@ -284,7 +284,7 @@ class LocalMSAConvBlock(nn.Module):
 
 class CascadeUnetLayer(nn.Module):
 
-	def __init__(self, baseC, baseM, H=64, W=64, C_factor=2, M_factor=1, u_depth=5):
+	def __init__(self, baseC=1, baseM=2, H=64, W=64, C_factor=2, M_factor=1, u_depth=5):
 		super().__init__()
 
 		self.baseC = baseC
@@ -346,7 +346,38 @@ class CascadeUnetLayer(nn.Module):
 		return dec_pyr
 
 
-			
+class Encoder(nn.Module):
+	def __init__(self, fullC=384, baseC=1, baseM=2, H=64, W=64, C_factor=2, M_factor=1, u_depth=5):
+		super().__init__()
+
+		self.fullC = fullC
+		self.baseC = baseC
+		self.baseM = baseM
+		self.H = H
+		self.W = W
+		self.C_factor = C_factor
+		self.M_factor = M_factor
+		self.u_depth = u_depth
+
+
+		self.enc = nn.ModuleList()
+
+		C_list = []
+		M_list = []
+		C = baseC
+		for u in range(u_depth):
+			C_list.append(C)
+			M_list.append(M)
+			C *= C_factor
+			M *= M_factor
+
+		for u in range(u_depth):
+			self.enc.append(LocalMSAConvBlock(C_list[u], M_list[u]))
+
+			if u < u_depth - 1:
+				self.dec.append(LocalMSAConvBlock(C_list[u], M_list[u]))
+
+				self.up_proj.append(nn.Conv2d(C_list[u + 1], C_list[u], kernel_size=1, bias=False))
 				
 
 	
@@ -495,7 +526,9 @@ class VelociNet(nn.Module):
 			return out, featvec
 
 		return out
-			
+
+
+
 
 
 
