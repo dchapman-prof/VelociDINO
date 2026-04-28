@@ -40,20 +40,20 @@ class LocalMSAConvBlock(nn.Module):
 		# L2 normalization
 		qk_norm = torch.sum(v*v, dim=2)
 		qk_norm = torch.rsqrt(qk_norm + 0.000001)
-		qk = v * qk_norm    # B M d H W
+		qk = v * qk_norm	# B M d H W
 	
 		# Calculate qk dependence at all offsets
-		score_     = torch.ones((B,M,1,H,W,1), device=qk.device,requires_grad=False,dtype=torch.float32)         # [B M  H  W]
-		score_lr   = (qk[:,:,:,:,0:(W-1)]       * qk[:,:,:,:,1:W]).sum(dim=2)       # [B M  H  W-1]
-		score_bt   = (qk[:,:,:,0:(H-1),:]       * qk[:,:,:,1:H,:]).sum(dim=2)       # [B M H-1  W ]
-		score_d1   = (qk[:,:,:,0:(H-1),0:(W-1)] * qk[:,:,:,1:H,1:W]).sum(dim=2)     # [B M H-1 W-1]
-		score_d2   = (qk[:,:,:,0:(H-1),1:W]     * qk[:,:,:,1:H,0:(W-1)]).sum(dim=2) # [B M H-1 W-1]
+		score_	 = torch.ones((B,M,1,H,W,1), device=qk.device,requires_grad=False,dtype=torch.float32)		 # [B M  H  W]
+		score_lr   = (qk[:,:,:,:,0:(W-1)]	   * qk[:,:,:,:,1:W]).sum(dim=2)	   # [B M  H  W-1]
+		score_bt   = (qk[:,:,:,0:(H-1),:]	   * qk[:,:,:,1:H,:]).sum(dim=2)	   # [B M H-1  W ]
+		score_d1   = (qk[:,:,:,0:(H-1),0:(W-1)] * qk[:,:,:,1:H,1:W]).sum(dim=2)	 # [B M H-1 W-1]
+		score_d2   = (qk[:,:,:,0:(H-1),1:W]	 * qk[:,:,:,1:H,0:(W-1)]).sum(dim=2) # [B M H-1 W-1]
 	
 		# Pad to get the scores in a 3x3 neighborhood
-		score_l    = torch.pad(score_lr, (1,0,0,0))   # [B M H W]
-		score_r    = torch.pad(score_lr, (0,1,0,0))
-		score_b    = torch.pad(score_bt, (0,0,1,0))
-		score_t    = torch.pad(score_bt, (0,0,0,1))
+		score_l	= torch.pad(score_lr, (1,0,0,0))   # [B M H W]
+		score_r	= torch.pad(score_lr, (0,1,0,0))
+		score_b	= torch.pad(score_bt, (0,0,1,0))
+		score_t	= torch.pad(score_bt, (0,0,0,1))
 		score_bl   = torch.pad(score_d1, (1,0,1,0))
 		score_tl   = torch.pad(score_d2, (1,0,0,1))
 		score_br   = torch.pad(score_d2, (0,1,1,0))
@@ -68,20 +68,20 @@ class LocalMSAConvBlock(nn.Module):
 			torch.reshape(score_tl, (B,M,1,H,W,1)),
 			torch.reshape(score_br, (B,M,1,H,W,1)),
 			torch.reshape(score_tr, (B,M,1,H,W,1)),
-				dim=5)                                # [B M 1 H W 9]
+				dim=5)								# [B M 1 H W 9]
 		
 		# Shift the values around (there has to be a better way...)
 		v = torch.reshape(v, (B,C,H,W))
 		v_l  = torch.pad(v[:,:,:,0:(W-1)], (1,0,0,0))
-		v_r  = torch.pad(v[:,:,:,1:W],     (0,1,0,0))
+		v_r  = torch.pad(v[:,:,:,1:W],	 (0,1,0,0))
 		v_b  = torch.pad(v[:,:,0:(H-1),:], (0,0,1,0))
-		v_t  = torch.pad(v[:,:,1:H,:],     (0,0,0,1))
+		v_t  = torch.pad(v[:,:,1:H,:],	 (0,0,0,1))
 		v_bl = torch.pad(v[:,:,0:(H-1),0:(W-1)], (1,0,1,0))
-		v_tl = torch.pad(v[:,:,0:H,    0:(W-1)], (1,0,0,1))
-		v_br = torch.pad(v[:,:,0:(H-1),1:W],     (0,1,1,0))
-		v_tr = torch.pad(v[:,:,1:H,    1:W],     (0,1,0,1))  # [B C H W]
+		v_tl = torch.pad(v[:,:,0:H,	0:(W-1)], (1,0,0,1))
+		v_br = torch.pad(v[:,:,0:(H-1),1:W],	 (0,1,1,0))
+		v_tr = torch.pad(v[:,:,1:H,	1:W],	 (0,1,0,1))  # [B C H W]
 		v_stack = torch.cat(
-			torch.reshape(v,    (B,M,d,H,W,1)),
+			torch.reshape(v,	(B,M,d,H,W,1)),
 			torch.reshape(v_l,  (B,M,d,H,W,1)),
 			torch.reshape(v_r,  (B,M,d,H,W,1)),
 			torch.reshape(v_b,  (B,M,d,H,W,1)),
@@ -90,10 +90,10 @@ class LocalMSAConvBlock(nn.Module):
 			torch.reshape(v_tl, (B,M,d,H,W,1)),
 			torch.reshape(v_br, (B,M,d,H,W,1)),
 			torch.reshape(v_tr, (B,M,d,H,W,1),
-				dim=5)                                # [B M d H W 9]
+				dim=5)								# [B M d H W 9]
 	
 		# Perform softmax of scores
-		score = F.softmax(score, dim=5)               # [B M 1 H W 9]
+		score = F.softmax(score, dim=5)			   # [B M 1 H W 9]
 		
 		# Weighted sum
 		z = (score * v_stack).sum(dim=5)  # [B, M, d, H, W]
@@ -204,20 +204,20 @@ class LocalMSAConvBlock(nn.Module):
 		qk_norm = torch.sum(v*v, dim=2, keepdim=True)
 		qk_norm = torch.rsqrt(qk_norm + 0.000001)
 		#print('qk_norm.shape', qk_norm.shape)
-		qk = v * qk_norm    # B M d H W
+		qk = v * qk_norm	# B M d H W
 	
 		# Calculate qk dependence at all offsets
-		score_     = torch.ones((B,M,1,H,W,1), device=qk.device, dtype=x.dtype,requires_grad=False)#dtype=torch.float32)         # [B M  H  W]
-		score_lr   = (qk[:,:,:,:,0:(W-1)]       * qk[:,:,:,:,1:W]).sum(dim=2)       # [B M  H  W-1]
-		score_bt   = (qk[:,:,:,0:(H-1),:]       * qk[:,:,:,1:H,:]).sum(dim=2)       # [B M H-1  W ]
-		score_d1   = (qk[:,:,:,0:(H-1),0:(W-1)] * qk[:,:,:,1:H,1:W]).sum(dim=2)     # [B M H-1 W-1]
-		score_d2   = (qk[:,:,:,0:(H-1),1:W]     * qk[:,:,:,1:H,0:(W-1)]).sum(dim=2) # [B M H-1 W-1]
+		score_	 = torch.ones((B,M,1,H,W,1), device=qk.device, dtype=x.dtype,requires_grad=False)#dtype=torch.float32)		 # [B M  H  W]
+		score_lr   = (qk[:,:,:,:,0:(W-1)]	   * qk[:,:,:,:,1:W]).sum(dim=2)	   # [B M  H  W-1]
+		score_bt   = (qk[:,:,:,0:(H-1),:]	   * qk[:,:,:,1:H,:]).sum(dim=2)	   # [B M H-1  W ]
+		score_d1   = (qk[:,:,:,0:(H-1),0:(W-1)] * qk[:,:,:,1:H,1:W]).sum(dim=2)	 # [B M H-1 W-1]
+		score_d2   = (qk[:,:,:,0:(H-1),1:W]	 * qk[:,:,:,1:H,0:(W-1)]).sum(dim=2) # [B M H-1 W-1]
 	
 		# Pad to get the scores in a 3x3 neighborhood
-		score_l    = F.pad(score_lr, (1,0,0,0))   # [B M H W]
-		score_r    = F.pad(score_lr, (0,1,0,0))
-		score_b    = F.pad(score_bt, (0,0,1,0))
-		score_t    = F.pad(score_bt, (0,0,0,1))
+		score_l	= F.pad(score_lr, (1,0,0,0))   # [B M H W]
+		score_r	= F.pad(score_lr, (0,1,0,0))
+		score_b	= F.pad(score_bt, (0,0,1,0))
+		score_t	= F.pad(score_bt, (0,0,0,1))
 		score_bl   = F.pad(score_d1, (1,0,1,0))
 		score_tl   = F.pad(score_d2, (1,0,0,1))
 		score_br   = F.pad(score_d2, (0,1,1,0))
@@ -232,20 +232,20 @@ class LocalMSAConvBlock(nn.Module):
 			torch.reshape(score_tl, (B,M,1,H,W,1)),
 			torch.reshape(score_br, (B,M,1,H,W,1)),
 			torch.reshape(score_tr, (B,M,1,H,W,1))),
-				dim=5)                                # [B M 1 H W 9]
+				dim=5)								# [B M 1 H W 9]
 		
 		# Shift the values around (there has to be a better way...)
 		v = torch.reshape(v, (B,C,H,W))
 		v_l  = F.pad(v[:,:,:,0:(W-1)], (1,0,0,0))
-		v_r  = F.pad(v[:,:,:,1:W],     (0,1,0,0))
+		v_r  = F.pad(v[:,:,:,1:W],	 (0,1,0,0))
 		v_b  = F.pad(v[:,:,0:(H-1),:], (0,0,1,0))
-		v_t  = F.pad(v[:,:,1:H,:],     (0,0,0,1))
+		v_t  = F.pad(v[:,:,1:H,:],	 (0,0,0,1))
 		v_bl = F.pad(v[:,:,0:(H-1),0:(W-1)], (1,0,1,0))
-		v_tl = F.pad(v[:,:,1:H,    0:(W-1)], (1,0,0,1))
-		v_br = F.pad(v[:,:,0:(H-1),1:W],     (0,1,1,0))
-		v_tr = F.pad(v[:,:,1:H,    1:W],     (0,1,0,1))  # [B C H W]
+		v_tl = F.pad(v[:,:,1:H,	0:(W-1)], (1,0,0,1))
+		v_br = F.pad(v[:,:,0:(H-1),1:W],	 (0,1,1,0))
+		v_tr = F.pad(v[:,:,1:H,	1:W],	 (0,1,0,1))  # [B C H W]
 		v_stack = torch.cat((
-			torch.reshape(v,    (B,M,d,H,W,1)),
+			torch.reshape(v,	(B,M,d,H,W,1)),
 			torch.reshape(v_l,  (B,M,d,H,W,1)),
 			torch.reshape(v_r,  (B,M,d,H,W,1)),
 			torch.reshape(v_b,  (B,M,d,H,W,1)),
@@ -254,10 +254,10 @@ class LocalMSAConvBlock(nn.Module):
 			torch.reshape(v_tl, (B,M,d,H,W,1)),
 			torch.reshape(v_br, (B,M,d,H,W,1)),
 			torch.reshape(v_tr, (B,M,d,H,W,1))),
-				dim=5)                                # [B M d H W 9]
+				dim=5)								# [B M d H W 9]
 	
 		# Perform softmax of scores
-		score = F.softmax(score, dim=5)               # [B M 1 H W 9]
+		score = F.softmax(score, dim=5)			   # [B M 1 H W 9]
 		
 		# Weighted sum
 		z = (score * v_stack).sum(dim=5)  # [B, M, d, H, W]
@@ -353,7 +353,7 @@ class LinearLens(nn.Module):
 	def __init__(self, outC=384, baseC=16, C_factor=2, u_depth0=2, u_depth1=5):
 		super().__init__()
 	
-		self.baseC    = baseC
+		self.baseC	= baseC
 		self.C_factor = C_factor
 		self.u_depth0 = u_depth0
 		self.u_depth1 = u_depth1
@@ -398,12 +398,12 @@ class VelociNet(nn.Module):
 		super().__init__()
 	
 		self.in_shape = in_shape
-		self.baseH    = baseH
-		self.baseW    = baseW
+		self.baseH	= baseH
+		self.baseW	= baseW
 		self.n_layer  = n_layer
-		self.outC     = outC
-		self.baseC    = baseC
-		self.baseM    = baseM
+		self.outC	 = outC
+		self.baseC	= baseC
+		self.baseM	= baseM
 		self.C_factor = C_factor
 		self.M_factor = M_factor
 		self.u_depth0 = u_depth0
@@ -484,7 +484,7 @@ class VelociNet(nn.Module):
 
 				featvec.append(feat_i)
 
-		#--------
+		#--------+
 		# Final lens
 		#--------
 		out = self.lens(stream)
@@ -495,3 +495,114 @@ class VelociNet(nn.Module):
 		return out
 			
 
+
+
+
+#-----------------------------------------------
+#-----------------------------------------------
+# Laplacian Transform (for auto-encoder)
+#-----------------------------------------------
+#-----------------------------------------------
+def LaplacianTranform(x, u_depth=5):
+	
+	# Obtain dimensions
+	N,C,H,W = x.shape
+	
+	# Peform downsampling
+	r = []   # residual maps
+	z = x
+	for u in range(0, u_depth-1):
+		
+		# Calculate residual
+		z_down = F.avg_pool2d(z, kernel_size=2, stride=2, count_include_pad=False)
+		z_up   = F.interpolate(z_down, scale_factor=2.0, mode='bilinear', align_corners=False)
+		residual = z - z_up
+		r.append(residual)
+		
+		# Downsample the working image
+		z = z_down
+		
+	# throw the last image in the residual set
+	r.append(z)
+	return r
+
+
+def InverseLaplacianTransform(r):
+	
+	u_depth = len(r)
+	
+	z = r[u_depth-1]
+	for u in range(u_depth-1, -1, -1):
+		z_down = z
+		z_up   = F.interpolate(z_down, scale_factor=2.0, mode='bilinear', align_corners=False)
+		z = r[u] + z_up
+
+	return z
+
+
+#-----------------------------------------------
+#-----------------------------------------------
+# Shuffle 1x1 convolution for linear encoder projection
+#-----------------------------------------------
+#-----------------------------------------------
+def channel_shuffle(x, groups=4):
+	N,C,H,W = x.size()
+	channels_per_group = C // groups
+	x = x.view(N, groups, channels_per_group, H, W)
+	x = x.transpose(1, 2).contiguous()
+	x = x.view(N,C,H,W)
+	return x
+
+class ShuffleConv1x1(nn.Module):
+	
+	def __init__(self, inC=16, midC=256, outC=768, groups=4):
+		super().__init__()
+		self.inC = inC
+		self.midC = midC
+		self.outC = outC
+		self.groups = groups
+		self.conv1 = nn.Conv2d(inC, midC, kernel_size=1, groups=groups, bias=False)
+		self.conv2 = nn.Conv2d(256, 4096, kernel_size=1, groups=4, bias=False)
+
+	def forward(self, x):
+		x = self.conv1(x)
+		x = channel_shuffle(x, groups=self.groups)
+		x = self.conv2(x)
+
+#-----------------------------------------------
+#-----------------------------------------------
+# Encoder using Laplacing Transform + 
+#  Pointwise gating (Overcomplete Dynamic Coordinate Scaling)
+#-----------------------------------------------
+#-----------------------------------------------
+
+class ResidualOverproj(nn.Module):
+	
+	def __init__(self, inC=384, midC=768, overC=768, outC=16, groups=4):
+		super.__init__()
+		
+		self.conv3x3  = nn.Conv2d(inC, inC, 3, groups=inC, padding='same')
+		self.overproj = ShuffleConv1x1(inC,midC,overC,groups)
+
+	def forward(self, x):
+		
+		x = self.conv3x3(x)
+		x = self.overproj(x)
+		return x
+
+#
+# input  x  [N inC H W]
+#
+# output hierarchical stream (len=u_depth)
+#
+class Encoder(nn.Module):
+	
+	def __init__(self, inC=384, baseC=16, u_depth=5, groups=4, overscale=2):
+		super.__init__()
+		
+		# Create the projections
+		
+	
+	def forward(self, x):
+		
+		
