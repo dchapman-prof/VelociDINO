@@ -89,7 +89,7 @@ class LocalMSAConvBlock(nn.Module):
 			torch.reshape(v_bl, (B,M,d,H,W,1)),
 			torch.reshape(v_tl, (B,M,d,H,W,1)),
 			torch.reshape(v_br, (B,M,d,H,W,1)),
-			torch.reshape(v_tr, (B,M,d,H,W,1),
+			torch.reshape(v_tr, (B,M,d,H,W,1)),
 				dim=5)								# [B M d H W 9]
 	
 		# Perform softmax of scores
@@ -562,7 +562,7 @@ class ShuffleConv1x1(nn.Module):
 		self.outC = outC
 		self.groups = groups
 		self.conv1 = nn.Conv2d(inC, midC, kernel_size=1, groups=groups, bias=False)
-		self.conv2 = nn.Conv2d(256, 4096, kernel_size=1, groups=4, bias=False)
+		self.conv2 = nn.Conv2d(midC, outC, kernel_size=1, groups=4, bias=False)
 
 	def forward(self, x):
 		x = self.conv1(x)
@@ -578,7 +578,7 @@ class ShuffleConv1x1(nn.Module):
 
 class ResidualOverproj(nn.Module):
 	
-	def __init__(self, inC=384, midC=768, overC=768, outC=16, groups=4):
+	def __init__(self, inC=384, midC=768, overC=768, groups=4):
 		super.__init__()
 		
 		self.conv3x3  = nn.Conv2d(inC, inC, 3, groups=inC, padding='same')
@@ -590,19 +590,188 @@ class ResidualOverproj(nn.Module):
 		x = self.overproj(x)
 		return x
 
+
+def BlowUpChannels(x, overscale):
+	N,C,H,W = x.shape
+	x = torch.reshape(x, (N, 1, C, H, W))
+	x = torch.repeat(x, (1,overscale,1,1,1))
+	x = torch.reshape(x, (N,overscale*C,H,W)).contiguous()
+	return x
+
+def BlowDownChannels(x, overscale):
+	N,C,H,W = x.shape
+	C = C // overscale
+	x = torch.reshape(x, (N, overscale, C, H, W))
+	x = torch.mean   (x, dim=1)
+	return x
+
+#-------------------------
 #
-# input  x  [N inC H W]
+#  input Laplace transform
+#      r0[64 64 384]  r1[32 32 384]   r2[16 16 384]   r3[8 8 384]   r4[4 4 384]   z5[2 2 384]
 #
-# output hierarchical stream (len=u_depth)
-#
+#  output Encoded features
+#      e0[64 64 16]   e1[32 32 32]    e2[16 16 64]    e3[8 8 128]   e4[4 4 256]   z5[2 2 384]
+# 
+#-------------------------
 class Encoder(nn.Module):
 	
-	def __init__(self, inC=384, baseC=16, u_depth=5, groups=4, overscale=2):
+	def __init__(self, inC=384, baseC=16, C_factor=2, u_depth=5, groups=4, overscale=2):
 		super.__init__()
+		self.inC = inC
+		self.baseC = baseC
+		self.u_depth = u_depth
+		self.groups = groups
+		self.overscale = overscale
+		self.C_factor = C_factor
 		
-		# Create the projections
+		self.downproj      = nn.ModuleList()
+		self.scale_weights = nn.ModuleList()
 		
+		# For each layer in u_depth
+		overC = inC * overscale
+		outC = baseC
+		for u in range(u_depth):
 	
+			# Convert inC into overscale   project 384->768 with 3x3 conv
+			self.scale_weights.append(  ResidualOverproj(inC,overC,overC,groups)  )   
+
+			# Calculate basis dimensions  768 -> 16 (depth dependent)
+			self.downproject.append(  ShuffleConv1x1(overC, inC, outC, groups)  )
+			
+			outC *= C_factor
+	
+	# x is a laplace transform of input
 	def forward(self, x):
 		
+		overC = self.inC * self.overscale
+		
+		# Start at the end of the pyramid
+		outC = self.baseC
+		for u in range(self.u_depth-1):
+			outC *= C_factor
+
+		# Make an empty pyramid
+		enc_pyr = []
+		for u in range(self.u_depth):
+			enc_pyr.append( None )
+
+		
+		# Perform the inverse pyramid
+		z_down = x[self.u_depth-1]
+		enc_pyr[self.u_depth-1] = z_down
+		for u in range(self.u_depth-2, -1, -1):
+		
+			# Calculate scaled weights
+			weights = self.scale_weights(z_down)
+			weights = F.sigmoid(weights)
+			weights = F.interpolate(weights, scale_factor=2.0, mode='bilinear', align_corners=False)
+			
+			# Blow up the current layer (to overscale)
+			r = BlowUpChannels(x[u], self.overscale)
+			
+			# Multiply by scaled weights
+			r = r*weights
+			
+			# Downproject channels  768 -> 16
+			e = self.downproject(e)
+			
+			# Put into pyramid
+			enc_pyr[u] = e
+			
+			# Next z
+			z_down = F.interpolate(z_down, scale_factor=2.0, mode='bilinear', align_corners=False)
+			z_down = z_down + x[u]   # add residual
+			
+		
+		return enc_pyr
+		
+
+
+#-------------------------
+#
+#  input Encoded features
+#      e0[64 64 16]   e1[32 32 32]    e2[16 16 64]    e3[8 8 128]   e4[4 4 256]   z5[2 2 384]
+# 
+#  output Laplace transform
+#      r0[64 64 384]  r1[32 32 384]   r2[16 16 384]   r3[8 8 384]   r4[4 4 384]   z5[2 2 384]
+#
+#-------------------------
+class Decoder(nn.Module):
+	
+	def __init__(self, inC=384, baseC=16, C_factor=2, u_depth=5, groups=4, overscale=2):
+		super.__init__()
+		self.inC = inC
+		self.baseC = baseC
+		self.u_depth = u_depth
+		self.groups = groups
+		self.overscale = overscale
+		self.C_factor = C_factor
+		
+		self.upproj      = nn.ModuleList()
+		self.scale_weights = nn.ModuleList()
+		
+		# For each layer in u_depth
+		overC = inC * overscale
+		outC = baseC
+		for u in range(u_depth):
+	
+			# Convert inC into overscale   project 384->768 with 3x3 conv
+			self.scale_weights.append(  ResidualOverproj(inC,overC,overC,groups)  )   
+
+			# Calculate basis dimensions  16 -> 768 (depth dependent)
+			self.upproject.append(  ShuffleConv1x1(outC, inC, overC, groups)  )
+			
+			outC *= C_factor
+	
+	
+	def forward(self, e):
+		
+		overC = self.inC * self.overscale
+		
+		# Start at the end of the pyramid
+		outC = self.baseC
+		for u in range(self.u_depth-1):
+			outC *= C_factor
+
+		# Make an empty pyramid
+		dec_pyr = []
+		for u in range(self.u_depth):
+			dec_pyr.append( None )
+
+		
+		# Perform the inverse pyramid
+		z_down = e[self.u_depth-1]
+		dec_pyr[self.u_depth-1] = z_down
+		for u in range(self.u_depth-2, -1, -1):
+		
+			# Calculate scaled weights
+			weights = self.scale_weights(z_down)
+			weights = F.sigmoid(weights)
+			weights = F.interpolate(weights, scale_factor=2.0, mode='bilinear', align_corners=False)
+			
+			# Upproject channels  16 -> 768
+			r = self.upproject(x[u])
+		
+			# Multiply by scaled weights
+			r = r*weights
+			
+			# Blow Down Channels
+			r = BlowDownChannels(r, self.overscale)
+			
+			# Put into pyramid
+			dec_pyr[u] = r
+			
+			# Up to next z layer
+			z_down = F.interpolate(z_down, scale_factor=2.0, mode='bilinear', align_corners=False)
+			z_down = z_down + r
+		
+		return dec_pyr
+
+def main():
+
+	print('Success!')
+		
+if __name__ == "__main__":
+	main()
 		
