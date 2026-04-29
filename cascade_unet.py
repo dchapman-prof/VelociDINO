@@ -842,8 +842,8 @@ def main():
 	reader = blockreader_sa1b.SA1B_DINO_blockreader(dataset_folder, batch_size)
 	n_img   = reader.len()
 	#n_img   = 150
-	#n_batch = (n_img+batch_size-1) // batch_size
-	n_batch = n_img // batch_size    # NO partial batches
+	n_batch = (n_img+batch_size-1) // batch_size
+	#n_batch = n_img // batch_size    # NO partial batches
 	n_epoch = 90
 
 	print(f"N images: {n_img}")
@@ -918,7 +918,10 @@ def main():
 			#----------------
 			# Read the images/features from lmdb
 			#----------------
-			images, features_np = reader.read_batch()
+			images, features_np, keys = reader.read_batch()
+
+			if features_np.shape[0]!=batch_size:    # NO partial batches
+				continue
 
 			features = torch.tensor(features_np, dtype=torch.uint8, device='cuda', requires_grad=False)
 

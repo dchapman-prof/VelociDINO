@@ -3,6 +3,7 @@
 #include <cmath>
 #include <torch/extension.h>
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 #define PI_OVER_180  0.0174532925199
 
@@ -552,7 +553,7 @@ void bicubic_aa_uint8_kernel(
 	// Store the final value color
 	//----
 	for (int ic=0; ic<3; ic++) {
-		float y = out_y[ic] / (AAY*AAX);
+		float y = out_y[ic] / (255.0*AAY*AAX);
 		//y = clamp(y, 0.0, 255.0);
 		//uint8_t y8 = (uint8_t)y;
 		//out[ idx_out ] = y8;
@@ -609,7 +610,7 @@ void bicubic_aa_uint8_cuda(
 		printf("ERROR: bicubic_aa_uint8_cuda inconsistent channels\n");
 		exit(1);
 	}
-	if (iC!=3 or iC!=4) {
+	if (iC!=3 && iC!=4) {
 		printf("ERROR: bicubic_aa_uint8_cuda channels not equal to 3 or 4\n");
 		exit(1);
 	}
@@ -910,7 +911,8 @@ __device__ float random_expo(uint32_t seed, float lamda)
 //  N H W                int32
 //  seed                            seed for normal distribution hashing
 //--------------------------
-__global__ void augment_photometric_kernel(
+__global__
+void augment_photometric_kernel(
 	const float4* __restrict__ input,
 	float4* __restrict__ output,
 	const float* h_shifts,       // Hue shift array [N]  (0 to 360.0)
@@ -927,7 +929,8 @@ __global__ void augment_photometric_kernel(
 	int y = blockIdx.y * blockDim.y + threadIdx.y;
 	int n = blockIdx.z;
 
-	if (x >= W || y >= H || n >= N) return;
+	if (x >= W || y >= H || n >= N)
+		return;
 
 	// Which seed for normal random numbers?
 	uint32_t myseed = seed + n*(H*W*3) + y*(W*3) + x*3;
@@ -948,8 +951,8 @@ __global__ void augment_photometric_kernel(
 	// 3. HSV Jitter logic
 	// We must clamp to [0, 1] ONLY for the HSV conversion to prevent NaNs
 	float rc = clamp(r, 0.0, 1.0);
-	float gc = clamp(r, 0.0, 1.0);
-	float bc = clamp(r, 0.0, 1.0);
+	float gc = clamp(g, 0.0, 1.0);
+	float bc = clamp(b, 0.0, 1.0);
 
 	// RGB to HSV (Simplified for jitter)
 	float max_c = fmaxf(rc, fmaxf(gc, bc));
@@ -1000,6 +1003,7 @@ __global__ void augment_photometric_kernel(
 	pixel.x = (r - mean[0]) / std[0];
 	pixel.y = (g - mean[1]) / std[1];
 	pixel.z = (b - mean[2]) / std[2];
+	//pixel.w = 1.0;
 	// pixel.w (Alpha) usually remains unnormalized or set to 1.0
 
 	output[idx] = pixel;
@@ -1078,16 +1082,19 @@ unsigned int augment_photometric_cuda(
 		printf("ERROR augment_photometric_cuda expected 4 channels\n");
 		exit(1);
 	}
-	if (iN!=oN || iN!=hN || iN!=sN || iN!=vN || iN!=soN || iN!=noN || iN!=meN || iN!=stN) {
+	if (iN!=oN || iN!=hN || iN!=sN || iN!=vN || iN!=soN || iN!=noN) {
 		printf("ERROR augment_photometric_cuda inconsistent batch sizes\n");
 		exit(1);
 	}
 
 	// Run the kernel
-	dim3 threadsPerBlock(32, 32, 1); // 32x16 block in x-y plane, 4 deep in z
-	dim3 numBlocks((iW+31)/32, (iH+31)/32, iN);
+	dim3 threadsPerBlock(32, 16, 1); // 32x16 block in x-y plane, 4 deep in z
+	dim3 numBlocks((iW+31)/32, (iH+15)/16, iN);
 
-	augment_photometric_kernel<<<threadsPerBlock, numBlocks>>>(
+	printf("threadsPerBlock %d %d %d\n", threadsPerBlock.x, threadsPerBlock.y, threadsPerBlock.z);
+	printf("numBlocks %d %d %d\n", numBlocks.x, numBlocks.y, numBlocks.z);
+	
+	augment_photometric_kernel<<<numBlocks, threadsPerBlock>>>(
 		input_data,
 		output_data,
 		h_shifts_data,       // Hue shift array [N]  (0 to 360.0)
@@ -1161,8 +1168,8 @@ void restore_uint8_features_kernel(
 	//-----
 	uint32_t idx = y*W*C + x*C;
 	for (int c=0; c<C; c++) {
-		float   minval = (float)minvals[c];
-		float   maxval = (float)maxvals[c];
+		float   minval = __half2float(minvals[c]);
+		float   maxval = __half2float(maxvals[c]);
 		float   val    = (float)indata[idx];
 		val = minval + (maxval-minval)*(1.0/255.0)*val;
 		output[idx] = val;
@@ -1201,25 +1208,28 @@ void restore_uint8_features_cuda(
 	
 	// Read lengths
 	int iN = input.sizes()[0];
-	int iH = input.sizes()[1];
-	int iW = input.sizes()[2];
-	int iC = input.sizes()[3];
+	int iFrame = input.sizes()[1];
 	int oN = output.sizes()[0];
-	int oFrame = output.sizes()[1];
+	int oH = output.sizes()[1];
+	int oW = output.sizes()[2];
+	int oC = output.sizes()[3];
 	
 	// Calculate frame size
 	uint32_t len_header = 12;
-	uint32_t len_minvals = 2*iC;
-	uint32_t len_maxvals = 2*iC;
-	uint32_t len_payload = iH*iW*iC;
+	uint32_t len_minvals = 2*oC;
+	uint32_t len_maxvals = 2*oC;
+	uint32_t len_payload = oH*oW*oC;
 	uint32_t len_frame = len_header + len_minvals + len_maxvals + len_payload;
+	
+	printf("iN %d iFrame %d oN %d oH %d oW %d oC %d\n", iN, iFrame, oN, oH, oW, oC);
+	printf("len_header %d len_minvals %d len_maxvals %d len_payload %d len_frame %d\n", len_header, len_minvals, len_maxvals, len_payload, len_frame);
 	
 	// Shape checking
 	if (iN!=oN) {
 		printf("ERROR restore_uint8_features_cuda batch size mismatch\n");
 		exit(1);
 	}
-	if (oFrame!=len_frame) {
+	if (iFrame!=len_frame) {
 		printf("ERROR restore_uint8_features_cuda unexpected frame size\n");
 		exit(1);
 	}
@@ -1227,12 +1237,12 @@ void restore_uint8_features_cuda(
 
 	// Run the kernel
 	dim3 threadsPerBlock(32, 32, 1); // 32x16 block in x-y plane, 4 deep in z
-	dim3 numBlocks((iW+31)/32, (iH+31)/32, iN);
+	dim3 numBlocks((oW+31)/32, (oH+31)/32, oN);
 
-	restore_uint8_features_kernel<<<threadsPerBlock, numBlocks>>>(
+	restore_uint8_features_kernel<<<numBlocks, threadsPerBlock>>>(
 		input_data,
 		output_data,
-		iN, iH, iW, iC, oFrame);
+		oN, oH, oW, oC, iFrame);
 
 
 	printf("END   restore_uint8_features_cuda\n");
@@ -1302,7 +1312,7 @@ void roll_dice_kernel(
 	int iH, int iW, int oH, int oW, int mH, int mW,   // Image, outimg, and mask dimensions
 	int N,
 	float* __restrict__ img_corners_data,
-	float* __restrict__ img_aa_ker_data,
+	int*   __restrict__ img_aa_ker_data,
 	float* __restrict__ mask_corners_data,
 	float* __restrict__ blur_sigmas_x_data,  // Blur kernel sigmas array [N]
 	float* __restrict__ blur_sigmas_y_data,  // Blur kernel sigmas signams array [N]
@@ -1319,7 +1329,7 @@ void roll_dice_kernel(
 	int n_thread = blockDim.x;
 	int rank = bid * n_thread + tid;
 	
-	if (rank>N)   // out of bounds
+	if (rank>=N)   // out of bounds
 		return;
 	
 	//-----
@@ -1374,6 +1384,8 @@ void roll_dice_kernel(
 	v_factors_data[rank]      = v_factor;       // Value (Brightness) factor array [N]
 	sol_thresholds_data[rank] = sol_threshold;  // Solarization threshold array [N]
 	noise_scales_data[rank]   = noise_scale;    // Noise scales for gaussian additive noise
+
+	printf(" rank %d  sigma x %f y %f   mask_corners_data %p   blur_sigmas_x_data %p\n", rank, sigma_blur_x, sigma_blur_y,  mask_corners_data, blur_sigmas_x_data);
 
 	//-----
 	// Calculate corner points
@@ -1440,9 +1452,9 @@ void roll_dice_kernel(
 	
 	// Some very wierd 'corner' cases
 	c0_x = clamp(c0_x,0.0,1.0);  c0_y = clamp(c0_y,0.0,1.0);
-	c1_x = clamp(c0_x,0.0,1.0);  c1_y = clamp(c0_y,0.0,1.0);
-	c2_x = clamp(c0_x,0.0,1.0);  c2_y = clamp(c0_y,0.0,1.0);
-	c3_x = clamp(c0_x,0.0,1.0);  c3_y = clamp(c0_y,0.0,1.0);
+	c1_x = clamp(c1_x,0.0,1.0);  c1_y = clamp(c1_y,0.0,1.0);
+	c2_x = clamp(c2_x,0.0,1.0);  c2_y = clamp(c2_y,0.0,1.0);
+	c3_x = clamp(c3_x,0.0,1.0);  c3_y = clamp(c3_y,0.0,1.0);
 	
 	//-----
 	// Project corner points to image scale
@@ -1591,11 +1603,12 @@ unsigned int roll_dice_cuda(
 	torch::Tensor noise_scales,   // Noise scales for gaussian additive noise
 	unsigned int seed)
 {
-	printf("BEGIN roll_dice_cuda\n");
+	printf("BEGIN roll_dice_cuda\n"); 
+	fflush(stdout);
 	
 	// Pointer into the data arrays
 	float* img_corners_data    = img_corners.data_ptr<float>();
-	float* img_aa_ker_data     = img_aa_ker.data_ptr<float>();
+	int*   img_aa_ker_data     = img_aa_ker.data_ptr<int>();
 	float* mask_corners_data   = mask_corners.data_ptr<float>();
 	float* blur_sigmas_x_data  = blur_sigmas_x.data_ptr<float>();
 	float* blur_sigmas_y_data  = blur_sigmas_y.data_ptr<float>();
@@ -1604,6 +1617,8 @@ unsigned int roll_dice_cuda(
 	float* v_factors_data      = v_factors.data_ptr<float>();
 	float* sol_thresholds_data = sol_thresholds.data_ptr<float>();
 	float* noise_scales_data   = noise_scales.data_ptr<float>();
+	
+	printf("roll_dice_cuda  mask_corners_data %p   blur_sigmas_x_data %p\n", mask_corners_data, blur_sigmas_x_data);
 	
 	// Check sizes
 	int N = img_corners.sizes()[0];
@@ -1648,6 +1663,7 @@ unsigned int roll_dice_cuda(
 
 
 	printf("END   roll_dice_cuda\n");
+	fflush(stdout);
 	
 	return seed + 22*N;    // 20 seeds per image consumed
 }
