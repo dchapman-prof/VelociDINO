@@ -56,6 +56,7 @@ class SA1B_DINO_blockreader:
 		# Define the center crop transform
 		self.center_crop = transforms.CenterCrop(self.crop_size)
 
+
 		#-----------------
 		#	Initializes the LMDB environment lazily.
 		#	This is crucial when using multiple worker processes in a DataLoader
@@ -81,6 +82,7 @@ class SA1B_DINO_blockreader:
 		#-------
 		self.sidx = 0
 		self.eidx = 0
+
 
 	def len(self):
 		return len(self.keys)
