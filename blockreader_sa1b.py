@@ -134,10 +134,17 @@ class SA1B_DINO_blockreader:
 		# Return the batches
 		#-----------
 		if B==self.batch_size:
-			return self.images_np, self.features_np
+			return self.images_np, self.features_np, keys
 		else:
-			return self.images_np[0:B], self.features_np[0:B]
+			return self.images_np[0:B], self.features_np[0:B], keys
 
+
+	#-------
+	# Reset the start and end indices
+	#-------
+	def reset(self):
+		self.sidx = 0
+		self.eidx = 0
 
 
 #---------------------------------------
